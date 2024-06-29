@@ -8,14 +8,32 @@ import textwrap
 from importlib import import_module
 from pathlib import Path
 from types import BuiltinFunctionType, FunctionType, ModuleType, MethodDescriptorType, BuiltinMethodType
-from typing import Any
+from typing import Any, Literal, LiteralString
+import re
 
 import click
 
 FUNCTION_TYPES = (BuiltinFunctionType, MethodDescriptorType, BuiltinMethodType)
 SUPPORTED_TYPES = (*FUNCTION_TYPES, type)
 
-def parse_signature(sig: str, docstr: str | None) -> str:
+ParseTypesType = Literal["numpydoc", False]
+
+def parse_numpydoc_type(typestr: str) -> str:
+    """
+    Parse a numpydoc type string to a python type string.
+    
+    Arguments:
+      typestr: the numpydoc type string to parse
+    
+    Returns:
+      A python type string
+    """
+    # Convert numpydoc types to python types
+    typestr = typestr.replace(" or ", " | ")
+    typestr = re.sub(r"{([^}]+)}", r"Literal[\1]", typestr)
+    return typestr
+
+def parse_signature(sig: str, docstr: str | None, *, parse_types: ParseTypesType = False) -> str:
   """
   Parse the signature and docstring to generate a function signature.
   
@@ -26,6 +44,12 @@ def parse_signature(sig: str, docstr: str | None) -> str:
   Returns:
     A string starting from "(" and ending before ":"
   """
+  if (parse_types == "numpydoc") and docstr:
+    from numpydoc.docscrape import NumpyDocString
+    nd = NumpyDocString(docstr)
+  else:
+    nd = None
+  
   args = [x.strip() for x in sig.strip(" ()").split(", ")]
   
   newargs = []
@@ -34,16 +58,40 @@ def parse_signature(sig: str, docstr: str | None) -> str:
     argname = spl[0]
     if argname == "$self":
       argname = "self"
+    if argname == "$cls":
+      argname = "cls"
     argdef = spl[1] if len(spl) == 2 else None
     
     argtype = None
-    
+    if nd and (pars := nd["Parameters"]):
+      for par in pars:
+        if (par.name == argname) and par.type:
+          argtype = parse_numpydoc_type(par.type)
+          break
+        
     newargs.append(argname + (f": {argtype}" if argtype else "") + (f" = {argdef}" if argdef else ""))
-    
-  return f"({', '.join(newargs)})"
+
+  rettype = None
+  if nd and (r := nd["Returns"]):
+    if (len(r) == 1) and (rt := r[0].type):
+      rettype = parse_numpydoc_type(rt)
+    elif len(r) > 1:
+      rettypes = []
+      for rt in r:
+        if rt.type:
+          rettypes.append(parse_numpydoc_type(rt.type))
+        else:
+          rettypes.append("Any")
+      rettype: LiteralString = f"tuple[{', '.join(rettypes)}]"
+
+
+  ret = f" -> {r[0].type}" if rettype else ""
+
+  return f"({', '.join(newargs)}){ret}"
   
 
-def gen_function_entry(function: FunctionType | MethodDescriptorType | BuiltinFunctionType) -> str:
+def gen_function_entry(function: FunctionType | MethodDescriptorType | BuiltinFunctionType, *, 
+                       parse_types: ParseTypesType = False) -> str:
     """
     Generate the signature and docstring information for a given function.
 
@@ -64,13 +112,13 @@ def gen_function_entry(function: FunctionType | MethodDescriptorType | BuiltinFu
             doc = f'    """{function.__doc__}"""'
     else:
         doc = "    ..."  # noqa: Q000
-        
-    signature = parse_signature(function.__text_signature__, function.__doc__)
+
+    signature = parse_signature(function.__text_signature__, function.__doc__, parse_types=parse_types)
         
     return f"def {function.__name__}{signature}:\n{doc}\n"
 
 
-def gen_class_entry(cls: type) -> str:
+def gen_class_entry(cls: type, *, parse_types: ParseTypesType = False) -> str:
     """
     Generate the signature and docstring information for a given class.
 
@@ -83,7 +131,7 @@ def gen_class_entry(cls: type) -> str:
     dir_contents = [getattr(cls, function) for function in dir(cls)]
     
     methods = [
-        textwrap.indent(gen_function_entry(function), "    ")
+        textwrap.indent(gen_function_entry(function, parse_types=parse_types), "    ")
         for function in dir_contents
         if (type(function) in (MethodDescriptorType, BuiltinMethodType)) and
         hasattr(function, "__text_signature__") and
@@ -102,7 +150,7 @@ def gen_class_entry(cls: type) -> str:
     doc += "\n" + "\n".join(methods)
     return f"class {cls.__name__}:\n{doc}\n"
 
-def genentry(obj: Any) -> str:
+def genentry(obj: Any, *, parse_types: ParseTypesType = False) -> str:
     """
     Generate the signature and docstring information for a given function or class.
 
@@ -117,13 +165,13 @@ def genentry(obj: Any) -> str:
       A string suitable for inclusion in a `.pyi` file
     """
     if type(obj) in FUNCTION_TYPES:
-        return gen_function_entry(obj)
+        return gen_function_entry(obj, parse_types = parse_types)
     if type(obj) == type:
-        return gen_class_entry(obj)
+        return gen_class_entry(obj, parse_types = parse_types)
     msg = f"Unsupported type {type(obj)}"
     raise ValueError(msg)
 
-def genpyi(module: ModuleType) -> str:
+def genpyi(module: ModuleType, *, parse_types: ParseTypesType = False) -> str:
     """
     Generate the contents of a `.pyi` file for a given module.
 
@@ -140,17 +188,18 @@ def genpyi(module: ModuleType) -> str:
     to the `.pyi` file afterwards.
     """
     objs = [getattr(module, obj) for obj in dir(module)]
-    definitions = [genentry(obj) for obj in objs if type(obj) in SUPPORTED_TYPES]
+    definitions = [genentry(obj, parse_types=parse_types) for obj in objs if type(obj) in SUPPORTED_TYPES]
     contents = ["# flake8: noqa: PYI021", *sorted(definitions)]
     return "\n".join(contents)
 
-def genfile(modulename: str, outputlocation: Path) -> None:
+def genfile(modulename: str, outputlocation: Path, *, parse_types: ParseTypesType = False) -> None:
     """
     Generate a `.pyi` file for `modulename` and store it under the project root `outputlocation`.
 
     Arguments:
       modulename: The _fully qualified_ module name: e.g. `pypkg.rustlib`.
       outputlocation: The `Path` to the _project root_ where the resulting file should be saved. Note: 
+      *, parse_types: 
 
     Example:
       `genfile("pypkg.rustlib", Path("python"))` will result in the creation of `./python/pypkg/rustlib.pyi`
@@ -161,7 +210,7 @@ def genfile(modulename: str, outputlocation: Path) -> None:
       - the output file will be stored in a subdirectory based upon the fully qualified module name.
     """
     module = import_module(modulename)
-    output = genpyi(module)
+    output = genpyi(module, parse_types=parse_types)
     outputfile = outputlocation.joinpath("/".join(modulename.split("."))).with_suffix(".pyi")
     outputfile.parent.mkdir(parents=True, exist_ok=True)
     outputfile.write_text(output)
@@ -170,7 +219,8 @@ def genfile(modulename: str, outputlocation: Path) -> None:
 @click.command()
 @click.argument("modulename")
 @click.argument("outputlocation", type=click.Path(file_okay=False, resolve_path=True, path_type=Path))
-def _stubgen(modulename: str, outputlocation: Path) -> None:  # noqa: D417
+@click.option("--parse-numpydoc/--no-parse-numpydoc", "-n/", default=False, help="Parse the types from the docstring")
+def _stubgen(modulename: str, outputlocation: Path, parse_numpydoc: bool) -> None:  # noqa: D417
     """
     Generate a `.pyi` file for MODULENAME and store it under the project root OUTPUTLOCATION.
 
@@ -188,4 +238,5 @@ def _stubgen(modulename: str, outputlocation: Path) -> None:  # noqa: D417
 
       `stubgen pypkg.rustlib python` creates `./python/pypkg/rustlib.pyi`
     """  # noqa: D412
-    genfile(modulename, outputlocation)
+    
+    genfile(modulename, outputlocation, parse_types="numpydoc" if parse_numpydoc else False)
